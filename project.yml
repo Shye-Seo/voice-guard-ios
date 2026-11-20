@@ -27,6 +27,7 @@ targets:
         CFBundleDisplayName: VoiceGuard
         UILaunchScreen: {}
         NSMicrophoneUsageDescription: "주변 대화의 감정 격양 구간을 실시간으로 감지하고 자동으로 녹음하기 위해 마이크 접근 권한이 필요합니다. 분석은 100% 기기 내부에서만 처리됩니다."
+        NSFaceIDUsageDescription: "민감한 대화 녹음 파일을 보호하기 위해 Face ID로 앱 잠금을 해제합니다. 생체 정보는 기기 밖으로 나가지 않으며 앱이 저장하지 않습니다."
         UIBackgroundModes:
           - audio
         UIApplicationSceneManifest:

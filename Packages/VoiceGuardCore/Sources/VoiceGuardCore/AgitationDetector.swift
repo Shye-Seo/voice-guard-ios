@@ -52,6 +52,8 @@ public struct DetectionDecision: Sendable, Equatable {
     public let state: MonitorState
     public let agitationScore: Double
     public let noiseFloorDB: Double
+    /// 이 프레임에 적용된 격양 판정 점수 임계치 (민감도 프리셋별 상이)
+    public let scoreThreshold: Double
     public let shouldStartRecording: Bool
     public let shouldStopRecording: Bool
     public let triggerReason: String?
@@ -60,6 +62,7 @@ public struct DetectionDecision: Sendable, Equatable {
         state: MonitorState,
         agitationScore: Double,
         noiseFloorDB: Double,
+        scoreThreshold: Double = 0.58,
         shouldStartRecording: Bool,
         shouldStopRecording: Bool,
         triggerReason: String?
@@ -67,6 +70,7 @@ public struct DetectionDecision: Sendable, Equatable {
         self.state = state
         self.agitationScore = agitationScore
         self.noiseFloorDB = noiseFloorDB
+        self.scoreThreshold = scoreThreshold
         self.shouldStartRecording = shouldStartRecording
         self.shouldStopRecording = shouldStopRecording
         self.triggerReason = triggerReason
@@ -176,6 +180,7 @@ public final class AgitationDetector {
             state: state,
             agitationScore: agitationScore,
             noiseFloorDB: noiseFloorDB,
+            scoreThreshold: sensitivity.scoreThreshold,
             shouldStartRecording: shouldStart,
             shouldStopRecording: shouldStop,
             triggerReason: reason

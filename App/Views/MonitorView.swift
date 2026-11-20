@@ -13,6 +13,11 @@ struct MonitorView: View {
                     meterCard
                     controlButton
                     sensitivityCard
+                    energyCard
+
+                    if let statusMessage = monitorService.systemStatusMessage {
+                        systemStatusCard(message: statusMessage)
+                    }
 
                     if let reason = monitorService.activeTriggerReason {
                         triggerReasonCard(reason: reason)
@@ -117,6 +122,50 @@ struct MonitorView: View {
         }
         .padding()
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var energyCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("2-Stage VAD · 배터리")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(monitorService.isGateOpen ? "2단계 분석 중" : "1단계 절전 중")
+                    .font(.caption2)
+                    .foregroundStyle(monitorService.isGateOpen ? Color.orange : Color.secondary)
+            }
+
+            ProgressView(value: min(1.0, max(0.0, 1.0 - monitorService.deepAnalysisRatio)))
+                .tint(.green)
+
+            HStack {
+                Label(String(format: "절약 추정 %.1f%%", monitorService.estimatedBatterySavingsPercent), systemImage: "battery.75percent")
+                Spacer()
+                Label(String(format: "2단계 %.1f%%", monitorService.deepAnalysisRatio * 100), systemImage: "cpu")
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+
+            Text("평상시에는 1단계 에너지 게이트만 돌리고, 성량이 오를 때만 피치·스펙트럴 분석을 켭니다.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func systemStatusCard(message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: monitorService.isSuspendedBySystem ? "pause.circle.fill" : "arrow.triangle.2.circlepath")
+                .foregroundStyle(monitorService.isSuspendedBySystem ? Color.orange : Color.blue)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
     }
 
     private func triggerReasonCard(reason: String) -> some View {

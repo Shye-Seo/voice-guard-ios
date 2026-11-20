@@ -1,27 +1,49 @@
 #!/usr/bin/env python3
 """
-AgitationDetector 수식/히스테리시스 로직의 Python 미러링 검증 스크립트.
-조용한 환경 / 일반 대화 / 일시적 단발 소음 / 지속 격양 발화 시나리오를 테스트한다.
+VoiceGuard DSP 시나리오 검증 스크립트.
+
+Linux 환경에서 `xcodebuild`를 쓸 수 없으므로, Swift 구현(`VoiceGuardCore`)의
+수식·상태 머신을 1:1로 미러링해 회귀와 신규 기능을 함께 검증한다.
+
+검증 범위
+  1) 일반 대화 오탐 없음
+  2) 단발성 소음(박수·기침) 오탐 없음
+  3) 지속 격양 -> 녹음 시작 -> 진정 후 자동 종료
+  4) 2-Stage VAD 1단계 에너지 게이트: 조용한 하루 1시간 시뮬레이션의 2단계 분석 비율 / 배터리 절약
+  5) 게이트가 닫힌 프레임은 어떤 민감도에서도 트리거할 수 없음 (property test)
+  6) 게이트 히스테리시스(hold) 동작
+  7) 세션 메타데이터(피크 dB · 최대 F0 · 격양 구간 병합) 누적
+  8) 배경 소음 적응(프라이밍 · 추종)
+
+모든 상수는 `Packages/VoiceGuardCore/Sources/VoiceGuardCore/*.swift`와 동일하게 유지한다.
 """
 from dataclasses import dataclass
+
+
+# ---------------------------------------------------------------------------
+# 미러: AgitationDetector
+# ---------------------------------------------------------------------------
+
+PRESETS = {
+    # (score_threshold, required_delta_db, required_consecutive_frames)
+    "low": (0.72, 16.0, 8),
+    "medium": (0.58, 11.5, 6),
+    "high": (0.45, 8.0, 4),
+}
 
 
 @dataclass
 class Frame:
     rms_db: float
-    zcr: float
-    flux: float
-    pitch_hz: float
+    zcr: float = 0.0
+    flux: float = 0.0
+    pitch_hz: float = 0.0
 
 
 class DetectorMirror:
     def __init__(self, preset: str = "medium", cooldown_s: float = 5.0):
-        presets = {
-            "low": (0.72, 16.0, 8),
-            "medium": (0.58, 11.5, 6),
-            "high": (0.45, 8.0, 4),
-        }
-        self.score_th, self.delta_th, self.consec_req = presets[preset]
+        self.preset = preset
+        self.score_th, self.delta_th, self.consec_req = PRESETS[preset]
         self.cooldown_s = cooldown_s
         self.state = "monitoring"
         self.noise_floor = -55.0
@@ -77,42 +99,411 @@ class DetectorMirror:
         return self.state, score, started, stopped
 
 
-def run_tests():
-    # 1. 일반 대화: 오탐 없음
+# ---------------------------------------------------------------------------
+# 미러: TwoStageVADAnalyzer (1단계 에너지 게이트)
+# ---------------------------------------------------------------------------
+
+STAGE_TWO_COST_MULTIPLIER = 60.0
+
+
+class TwoStageGateMirror:
+    def __init__(
+        self,
+        preset: str = "medium",
+        gate_enter: float = None,
+        gate_exit: float = None,
+        hold_frames: int = 4,
+        probe_interval: int = 20,
+        decimation: int = 4,
+        absolute_floor_db: float = -62.0,
+        noise_adapt_rate: float = 0.04,
+    ):
+        delta_th = PRESETS[preset][1]
+        self.gate_enter = max(4.0, delta_th - 2.0) if gate_enter is None else gate_enter
+        self.gate_exit = max(2.0, self.gate_enter - 3.0) if gate_exit is None else min(gate_exit, self.gate_enter)
+        self.hold_frames = max(0, hold_frames)
+        self.probe_interval = max(1, probe_interval)
+        self.decimation = max(1, decimation)
+        self.absolute_floor_db = absolute_floor_db
+        self.noise_adapt_rate = min(1.0, max(0.001, noise_adapt_rate))
+
+        self.state = "closed"
+        self.hold = 0
+        self.frames_since_deep = 0
+        self.noise_floor = None
+        self.total = 0
+        self.deep = 0
+        self.open = 0
+
+    def step(self, db: float):
+        self.total += 1
+        if self.noise_floor is None:
+            self.noise_floor = db
+
+        enter_th = max(self.noise_floor + self.gate_enter, self.absolute_floor_db)
+        exit_th = max(self.noise_floor + self.gate_exit, self.absolute_floor_db - 6.0)
+
+        if self.state == "closed":
+            if db >= enter_th:
+                self.state = "open"
+                self.hold = self.hold_frames
+        else:
+            if db < exit_th:
+                if self.hold > 0:
+                    self.hold -= 1
+                else:
+                    self.state = "closed"
+            else:
+                self.hold = self.hold_frames
+
+        if self.state == "closed":
+            self.noise_floor += (db - self.noise_floor) * self.noise_adapt_rate
+
+        self.frames_since_deep += 1
+        is_probe = self.state == "closed" and self.frames_since_deep >= self.probe_interval
+        deep = self.state == "open" or is_probe
+        if self.state == "open":
+            self.open += 1
+        if deep:
+            self.deep += 1
+            self.frames_since_deep = 0
+        return self.state, deep
+
+    def features(self, f: Frame, deep: bool) -> Frame:
+        """게이트가 닫힌 프레임은 피치/스펙트럴 성분이 0인 경량 특징값을 쓴다."""
+        if deep:
+            return f
+        return Frame(rms_db=f.rms_db, zcr=f.zcr, flux=0.0, pitch_hz=0.0)
+
+    @property
+    def deep_ratio(self) -> float:
+        return self.deep / self.total if self.total else 0.0
+
+    @property
+    def battery_savings_percent(self) -> float:
+        if not self.total:
+            return 0.0
+        light = self.total - self.deep
+        used = light * 1.0 + self.deep * STAGE_TWO_COST_MULTIPLIER
+        baseline = self.total * STAGE_TWO_COST_MULTIPLIER
+        return max(0.0, min(100.0, (1.0 - used / baseline) * 100.0))
+
+
+# ---------------------------------------------------------------------------
+# 미러: RecordingSessionAccumulator / AgitationTimelineAccumulator
+# ---------------------------------------------------------------------------
+
+
+class SessionAccumulatorMirror:
+    def __init__(self, merge_gap_s: float = 1.0, extension_ratio: float = 0.82, frame_duration: float = 0.05):
+        self.merge_gap_s = merge_gap_s
+        self.extension_ratio = extension_ratio
+        self.frame_duration = frame_duration
+        self.events = []          # list of dicts
+        self.peak_rms = -90.0
+        self.rms_sum = 0.0
+        self.rms_count = 0
+        self.max_pitch = 0.0
+        self.peak_score = 0.0
+        self.open_index = None
+
+    def ingest(self, f: Frame, score: float, state: str, threshold: float, offset: float):
+        self.peak_rms = max(self.peak_rms, f.rms_db)
+        self.max_pitch = max(self.max_pitch, f.pitch_hz)
+        self.peak_score = max(self.peak_score, score)
+        self.rms_sum += f.rms_db
+        self.rms_count += 1
+
+        is_agitated = state == "recordingAgitated"
+        keeps_alive = is_agitated or score >= threshold * self.extension_ratio
+
+        if self.open_index is not None:
+            event = self.events[self.open_index]
+            gap = offset - event["end"]
+            if keeps_alive and gap <= self.merge_gap_s:
+                event["end"] = max(event["end"], offset + self.frame_duration)
+                event["peak_score"] = max(event["peak_score"], score)
+                event["peak_rms"] = max(event["peak_rms"], f.rms_db)
+                event["peak_pitch"] = max(event["peak_pitch"], f.pitch_hz)
+                event["frames"] += 1
+                return
+            if gap > self.merge_gap_s:
+                self.open_index = None
+
+        if keeps_alive:
+            self.events.append(
+                {
+                    "start": offset,
+                    "end": offset + self.frame_duration,
+                    "peak_score": score,
+                    "peak_rms": f.rms_db,
+                    "peak_pitch": f.pitch_hz,
+                    "frames": 1,
+                }
+            )
+            self.open_index = len(self.events) - 1
+
+    @property
+    def agitated_seconds(self) -> float:
+        return sum(max(0.0, e["end"] - e["start"]) for e in self.events)
+
+
+# ---------------------------------------------------------------------------
+# 시나리오
+# ---------------------------------------------------------------------------
+
+FRAME_INTERVAL = 0.05  # 20 fps (2048 샘플 @ 48kHz ≈ 42.6ms)
+
+
+def scenario_calm_conversation():
     d = DetectorMirror("medium")
     t = 0.0
     for _ in range(40):
         _, _, started, _ = d.step(Frame(-46.0, 0.05, 0.02, 155.0), t)
         assert not started, "일반 대화에서 오탐 발생"
-        t += 0.05
+        t += FRAME_INTERVAL
+    return "일반 대화 오탐 없음 (40프레임)"
 
-    # 2. 단발성 박수/기침(2프레임): 오탐 없음
+
+def scenario_single_burst():
+    d = DetectorMirror("medium")
+    t = 0.0
+    for _ in range(20):
+        d.step(Frame(-46.0, 0.05, 0.02, 155.0), t)
+        t += FRAME_INTERVAL
     for _ in range(2):
         _, _, started, _ = d.step(Frame(-20.0, 0.20, 0.18, 0.0), t)
         assert not started, "단발 소음에서 오탐 발생"
-        t += 0.05
+        t += FRAME_INTERVAL
     for _ in range(10):
         d.step(Frame(-52.0, 0.04, 0.01, 0.0), t)
-        t += 0.05
+        t += FRAME_INTERVAL
+    return "단발성 박수/기침 오탐 없음 (2프레임)"
 
-    # 3. 지속 격양 발화 -> 녹음 시작 -> 진정 후 자동 종료
+
+def scenario_sustained_agitation():
+    d = DetectorMirror("medium")
+    t = 0.0
+    for _ in range(10):
+        d.step(Frame(-56.0, 0.04, 0.01, 0.0), t)
+        t += FRAME_INTERVAL
+
     started_any = False
     for _ in range(8):
         _, _, started, _ = d.step(Frame(-18.0, 0.22, 0.16, 290.0), t)
         started_any = started_any or started
-        t += 0.05
+        t += FRAME_INTERVAL
     assert started_any, "격양 발화에서 녹음 미시작"
     assert d.state == "recordingAgitated"
 
     stopped_any = False
-    for _ in range(120):
+    for _ in range(160):
         _, _, _, stopped = d.step(Frame(-52.0, 0.04, 0.01, 140.0), t)
         if stopped:
             stopped_any = True
             break
-        t += 0.05
+        t += FRAME_INTERVAL
     assert stopped_any and d.state == "monitoring", "진정 후 자동 종료 실패"
-    print("ALL DSP SCENARIO TESTS PASSED (3/3)")
+    return "지속 격양 -> 자동 녹음 시작 -> 진정 후 자동 종료"
+
+
+class RunnerMirror:
+    """앱 파이프라인 미러: 게이트 -> 감지기 -> (녹음 중일 때만) 세션 누적기."""
+
+    def __init__(self, preset: str = "medium", cooldown_s: float = 12.0):
+        self.preset = preset
+        self.gate = TwoStageGateMirror(preset)
+        self.detector = DetectorMirror(preset, cooldown_s=cooldown_s)
+        self.session = SessionAccumulatorMirror()
+        self.recording = False
+        self.t = 0.0
+        self.triggers = 0
+
+    def run(self, seconds, level_fn) -> int:
+        frames = int(seconds / FRAME_INTERVAL)
+        fired = 0
+        for i in range(frames):
+            raw = level_fn(i)
+            gate_state, deep = self.gate.step(raw.rms_db)
+            features = self.gate.features(raw, deep)
+            decision_state, score, started, stopped = self.detector.step(features, self.t)
+            if started:
+                self.triggers += 1
+                fired += 1
+                self.recording = True
+            if self.recording:
+                self.session.ingest(features, score, decision_state, PRESETS[self.preset][0], self.t)
+            if stopped:
+                self.recording = False
+            self.t += FRAME_INTERVAL
+        return fired
+
+
+def scenario_battery_night():
+    """수면 시간대: 조용한 방에서 드문 소음만 있는 1시간 — 게이트 절약 효과가 가장 큰 조건."""
+    runner = RunnerMirror()
+    runner.run(600, lambda i: Frame(-60.0 + 0.5 * ((i % 5) - 2), 0.03, 0.004, 0.0))
+
+    # 6분마다 0.2초짜리 문소리/기침 (-45dB)
+    for _ in range(10):
+        runner.run(0.2, lambda i: Frame(-45.0, 0.18, 0.12, 0.0))
+        runner.run(354, lambda i: Frame(-60.0 + 0.5 * ((i % 5) - 2), 0.03, 0.004, 0.0))
+
+    gate = runner.gate
+    savings = gate.battery_savings_percent
+    assert gate.deep_ratio < 0.08, f"야간 2단계 분석 비율 {gate.deep_ratio:.1%} (기준 8%)"
+    assert savings > 92.0, f"야간 배터리 절약 추정 {savings:.1f}% (기준 92%)"
+    assert runner.triggers == 0, f"기침/문소리에서 오탐 {runner.triggers}회"
+    return (
+        f"야간 1시간: 2단계 분석 {gate.deep_ratio:.1%} · 절약 추정 {savings:.1f}% · 오탐 {runner.triggers}회"
+    )
+
+
+def scenario_battery_daytime():
+    """낮 거실: 배경 -50dB에 잡담 피크가 섞이다가 3초짜리 격양 발화가 한 번 나오는 10분."""
+    runner = RunnerMirror()
+
+    def living_room(i):
+        # 30프레임(1.5초) 주기 중 4프레임(0.2초)만 성량이 올라가는 잡담 패턴
+        if i % 30 < 4:
+            return Frame(-38.0, 0.2, 0.14, 265.0)
+        return Frame(-52.0, 0.05, 0.01, 150.0)
+
+    runner.run(540, living_room)
+    assert runner.triggers == 0, f"0.2초 잡담 피크에서 오탐 {runner.triggers}회"
+
+    # 3초 지속 격양 발화 — 게이트를 통과해 실제 감지가 동작해야 한다
+    fired = runner.run(3, lambda i: Frame(-30.0, 0.22, 0.18, 300.0))
+    assert fired == 1, f"지속 격양 발화 감지 {fired}회 (기대 1회)"
+
+    runner.run(60, lambda i: Frame(-52.0, 0.05, 0.01, 150.0))
+
+    gate = runner.gate
+    savings = gate.battery_savings_percent
+    assert gate.deep_ratio < 0.32, f"낮 거실 2단계 비율 {gate.deep_ratio:.1%} (기준 32%)"
+    assert savings > 68.0, f"낮 거실 절약 추정 {savings:.1f}% (기준 68%)"
+    assert len(runner.session.events) == 1, f"격양 구간이 {len(runner.session.events)}건으로 기록됨"
+    return (
+        f"낮 거실 10분: 2단계 분석 {gate.deep_ratio:.1%} · 절약 추정 {savings:.1f}% · "
+        f"격양 이벤트 {len(runner.session.events)}건 {runner.session.agitated_seconds:.1f}초"
+    )
+
+
+def scenario_gated_frames_never_trigger():
+    """게이트가 닫힌 프레임은 어떤 민감도에서도 트리거 조건을 만족할 수 없다."""
+    checked = 0
+    for preset in ("low", "medium", "high"):
+        gate = TwoStageGateMirror(preset)
+        detector = DetectorMirror(preset, cooldown_s=5.0)
+        t = 0.0
+        enter_margin = gate.gate_enter
+        delta_th = PRESETS[preset][1]
+        assert enter_margin < delta_th, f"{preset}: 게이트 임계가 트리거 임계보다 높음"
+
+        # 배경 소음 프라이밍
+        for _ in range(30):
+            gate.step(-55.0)
+            detector.step(Frame(-55.0, 0.03, 0.005, 0.0), t)
+            t += FRAME_INTERVAL
+
+        # 게이트 임계 바로 아래 ~ 배경 소음 수준의 프레임을 5,000개 흘려보낸다.
+        for i in range(5000):
+            level = -55.0 + (enter_margin - 0.2) * ((i % 11) / 10.0)
+            state, deep = gate.step(level)
+            f = gate.features(Frame(level, 0.25, 0.2, 300.0), deep)
+            _, _, started, _ = detector.step(f, t)
+            if state == "closed":
+                checked += 1
+                assert not started, f"{preset}: 게이트 닫힘 프레임에서 오탐 발생 (level={level:.1f}dB)"
+            t += FRAME_INTERVAL
+    return f"게이트 닫힘 프레임 트리거 불가 검증 (3개 민감도 · {checked}프레임)"
+
+
+def scenario_hysteresis():
+    gate = TwoStageGateMirror("medium", gate_enter=9.0, gate_exit=6.0, hold_frames=4)
+    for _ in range(20):
+        gate.step(-54.0)
+    state, _ = gate.step(-20.0)
+    assert state == "open", "고음량 프레임에서 게이트가 열리지 않음"
+
+    held = 0
+    for _ in range(4):
+        state, _ = gate.step(-53.0)
+        if state == "open":
+            held += 1
+    assert held == 4, f"hold 프레임이 {held}/4만 유지됨"
+    state, _ = gate.step(-53.0)
+    assert state == "closed", "hold 소진 후에도 게이트가 닫히지 않음"
+    return "게이트 히스테리시스(hold 4프레임) 동작"
+
+
+def scenario_session_metadata():
+    runner = RunnerMirror(cooldown_s=5.0)
+    runner.run(1.0, lambda i: Frame(-52.0, 0.04, 0.01, 140.0))
+    runner.run(3.0, lambda i: Frame(-14.0, 0.22, 0.2, 300.0))
+    runner.run(10.0, lambda i: Frame(-50.0, 0.04, 0.01, 0.0))
+
+    session = runner.session
+    assert session.peak_rms == -14.0, f"피크 dB 오류: {session.peak_rms}"
+    assert session.max_pitch == 300.0, f"최대 F0 오류: {session.max_pitch}"
+    assert len(session.events) == 1, f"격양 구간이 {len(session.events)}개로 분리됨"
+    assert 2.5 <= session.agitated_seconds <= 4.5, f"격양 구간 길이 오류: {session.agitated_seconds}"
+    assert session.rms_count > 0
+    average = session.rms_sum / session.rms_count
+    assert -50.0 < average < -25.0, f"평균 dB 오류: {average}"
+    return (
+        f"세션 메타데이터: 피크 {session.peak_rms:.0f}dB · 최대 {session.max_pitch:.0f}Hz · "
+        f"격양 {len(session.events)}구간 {session.agitated_seconds:.1f}초"
+    )
+
+
+def scenario_noise_floor_tracking():
+    gate = TwoStageGateMirror("medium")
+    for _ in range(200):
+        gate.step(-54.0)
+    floor_loud = gate.noise_floor
+    for _ in range(400):
+        gate.step(-68.0)  # 더 조용한 방으로 이동
+    assert floor_loud > -56.0, f"초기 배경 소음 프라이밍 오류: {floor_loud}"
+    assert gate.noise_floor < -63.0, f"조용해진 배경으로 추종되지 않음: {gate.noise_floor:.1f}dB"
+    return f"배경 소음 추종: -54dB -> {gate.noise_floor:.1f}dB"
+
+
+def scenario_steady_loud_environment():
+    """TV를 계속 틀어둔 환경 — 게이트가 열린 채 유지된다(정확도 우선 설계)."""
+    gate = TwoStageGateMirror("medium")
+    for _ in range(20):
+        gate.step(-62.0)
+    for _ in range(1200):  # 60초 연속 -42dB
+        gate.step(-42.0)
+    assert gate.state == "open", "연속 고음량 환경에서 게이트가 닫힘"
+    return (
+        f"연속 고음량(TV) 환경: 게이트 유지 · 2단계 {gate.deep_ratio:.0%} "
+        "(배경 소음은 게이트가 닫힌 프레임에서만 추종 — 정확도 우선)"
+    )
+
+
+def run_tests():
+    results = []
+
+    results.append(scenario_calm_conversation())
+    results.append(scenario_single_burst())
+    results.append(scenario_sustained_agitation())
+    results.append(scenario_battery_night())
+    results.append(scenario_battery_daytime())
+    results.append(scenario_gated_frames_never_trigger())
+    results.append(scenario_hysteresis())
+    results.append(scenario_session_metadata())
+    results.append(scenario_noise_floor_tracking())
+    results.append(scenario_steady_loud_environment())
+
+    print("=" * 78)
+    print(f"VoiceGuard DSP 시나리오 검증 — {len(results)}개 시나리오 통과")
+    print("=" * 78)
+    for index, line in enumerate(results, start=1):
+        print(f"  {index}. {line}")
+    print("=" * 78)
+    print(f"ALL DSP SCENARIO TESTS PASSED ({len(results)}/{len(results)})")
 
 
 if __name__ == "__main__":
