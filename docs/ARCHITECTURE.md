@@ -82,12 +82,54 @@ AVAudioEngine input tap (2048 samples @48kHz ≈ 42.6ms)
 - `RecordingDetailView` + `AgitationTimelineView`: Canvas로 음량 엔벨로프와 격양 구간 밴드를 그리고,
   이벤트 목록·지표·메모·m4a 공유/내보내기(`ShareLink`)·리포트 텍스트 공유/복사를 제공한다.
 
-## 5. 검증 범위
+## 5. 전사 · 핵심 쟁점 요약 (v1.2)
+
+```
+녹음 .m4a ──▶ SpeechTranscribing (SFSpeechRecognizer, 온디바이스 강제)
+                     │  · 45초 초과 시 최대 8구간 분할 → 오프셋 합산
+                     ▼
+        [SpeechTranscriptSegment] (start, end, text, confidence)
+                     │  normalize: 빈 발화 제거 · 시작순 정렬 · duration 클램프
+                     ▼
+   EpisodeSummarizer.annotate  ──  AgitationEvent[] (VAD 격양 구간)
+                     │  · 겹침 ≥ 0.2초 → 격양 발화, 이벤트 인덱스·최고 격양도 기록
+                     ▼
+   EpisodeSummarizer.summarize
+      ├─ 핵심 쟁점: 격양도 최고 → 겹침 최대 → 이른 시작 순으로 1개 선택
+      ├─ 키워드: 조사 제거 + 불용어 제외, 격양 발화 가중 2배, 상위 5개
+      ├─ 타임라인 마커: 핵심 쟁점 + 격양 이벤트별 피크 발화
+      └─ 한 문단 요약(headline)
+                     ▼
+   EpisodeReport ──▶ RecordingSessionRecord.episodeReport (index.json) ──▶ EpisodeReportView
+```
+
+핵심 설계 근거
+
+- **온디바이스 강제**: `SFSpeechURLRecognitionRequest.requiresOnDeviceRecognition = true`를 항상 켠다.
+  `supportsOnDeviceRecognition == false`면 서버 인식으로 폴백하지 않고 안내 문구와 함께 기능을 끈다.
+  앱의 개인정보 약속(오디오가 기기 밖으로 나가지 않음)과 심사 설명을 코드 수준에서 보장한다.
+- **구간 분할**: `SFSpeechRecognizer`는 긴 파일에서 정확도·메모리가 나빠지므로 45초 단위로 나눠 인식하고
+  각 세그먼트 타임스탬프에 조각 오프셋을 더해 원본 시간축으로 되돌린다(`SpeechAudioChunker`, 원본 파일 불변).
+- **매핑 임계 0.2초**: 격양 구간 경계에 스치는 단어 하나로 발화 전체를 격양으로 분류하지 않는다.
+  임계 미만이어도 겹침 시간과 이벤트 인덱스는 남겨 마커·디버깅에 쓴다.
+- **결정적 결과**: 마커·핵심 쟁점 식별자를 `StableIdentifier`(문자열 FNV 해시 → UUID)로 만들어
+  같은 입력이면 같은 리포트가 나온다. 테스트가 `generatedAt`을 주입해 완전 재현한다.
+- **요약기는 순수 로직**: 음성 인식기와 분리되어 있어 `ScriptedSpeechTranscriber`로 CI에서 고정 검증하고,
+  같은 알고리즘을 `scripts/verify_dsp.py` 11번 시나리오가 미러링한다.
+
+한계(실기기 검증 필요)
+
+- 한국어 온디바이스 모델은 iOS 설정에서 언어별로 내려받아야 하며, 미설치·저전력 모드에서 실패할 수 있다
+  (이때는 실패 사유를 한국어로 보여주고 재시도·설정 이동 버튼을 제공).
+- 화자 분리(speaker diarization)는 하지 않는다. 전사 타임라인은 화자 구분 없는 문장 흐름이다.
+- 전사 리포트는 `index.json`에 함께 저장되어 녹음 1건당 수십 KB가 늘어난다(길이에 비례).
+
+## 6. 검증 범위
 
 | 대상 | 방법 | 결과 |
 | --- | --- | --- |
-| `VoiceGuardCore` (DSP·상태 머신·타임라인·모델) | Linux Swift 6.0.3 툴체인으로 실제 컴파일 + XCTest 실행 | 17개 테스트 통과 |
-| DSP 시나리오 (게이트·배터리·오탐·메타데이터) | `scripts/verify_dsp.py` (Swift 수식 미러) | 10개 시나리오 통과 |
+| `VoiceGuardCore` (DSP·상태 머신·타임라인·모델·요약) | Linux Swift 6.0.3 툴체인으로 실제 컴파일 + `swift test` | 45개 테스트 통과 |
+| DSP·요약 시나리오 (게이트·배터리·오탐·메타데이터·에피소드 요약) | `scripts/verify_dsp.py` (Swift 수식 미러) | 11개 시나리오 통과 |
 | App 계층 (SwiftUI · AVFoundation · LocalAuthentication) | Linux에서 프레임워크 부재로 타입 체크 불가 → `swiftc -parse` 구문 검증 + 코드 리뷰 | 구문 오류 0건, **타입 체크·실기기 빌드 미검증** |
 
 App 계층은 Xcode 15.4/iOS 17 실기기에서 첫 빌드 시 다음을 확인해야 한다.
@@ -96,3 +138,5 @@ App 계층은 Xcode 15.4/iOS 17 실기기에서 첫 빌드 시 다음을 확인�
 2. `FileProtectionType.completeUnlessOpen`이 실제 파일에 적용되는지(설정 화면 "보호된 녹음 파일" 개수)
 3. Face ID 잠금 화면과 `ShareLink` 공유 시트가 잠금 상태에서 노출되지 않는지
 4. 배터리 소모 실측(야간 8시간 / 낮 4시간)과 게이트 절약 추정치의 방향성 일치 여부
+5. `SFSpeechRecognizer` 한국어 온디바이스 모델 다운로드 상태에서 전사·요약이 동작하는지, 권한 거부 시 안내가 맞는지
+6. 45초 초과 녹음의 구간 분할 인식이 타임스탬프를 원본 시간축으로 정확히 되돌리는지(경계 1초 이내)

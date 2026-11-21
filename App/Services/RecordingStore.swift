@@ -158,6 +158,13 @@ final class RecordingStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
         save()
     }
 
+    /// 온디바이스 전사·쟁점 요약을 녹음 인덱스에 저장한다(생성은 `EpisodeSummarizer`).
+    func updateEpisodeReport(for id: UUID, report: EpisodeReport?) {
+        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
+        records[index].episodeReport = report
+        save()
+    }
+
     func delete(_ record: RecordingSessionRecord) {
         if playingRecordID == record.id {
             stopPlayback()

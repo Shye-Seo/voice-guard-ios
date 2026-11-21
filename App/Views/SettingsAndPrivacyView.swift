@@ -1,13 +1,16 @@
 import SwiftUI
+import UIKit
 import VoiceGuardCore
 
 struct SettingsAndPrivacyView: View {
     @EnvironmentObject private var monitorService: AudioMonitorService
     @EnvironmentObject private var recordingStore: RecordingStore
     @EnvironmentObject private var appLockService: AppLockService
+    @Environment(\.openURL) private var openURL
 
     @AppStorage("hasAcknowledgedPrivacyNotice") private var hasAcknowledgedPrivacy = false
     @State private var isProcessingLock = false
+    @State private var speechAvailability: SpeechTranscriptionSupport.Availability = .needsPermission
 
     var body: some View {
         NavigationStack {
@@ -16,10 +19,12 @@ struct SettingsAndPrivacyView: View {
                 lockSection
                 protectionSection
                 energySection
+                speechSection
                 privacySection
                 legalSection
             }
             .navigationTitle("설정 · 안내")
+            .onAppear { refreshSpeechAvailability() }
         }
     }
 
@@ -107,6 +112,63 @@ struct SettingsAndPrivacyView: View {
         } footer: {
             Text("Face ID 사용을 위해 iOS 설정에서 Face ID가 등록되어 있어야 합니다.")
         }
+    }
+
+    // MARK: - 전사 · 요약(온디바이스 STT)
+
+    private var speechSection: some View {
+        Section {
+            HStack {
+                Label("온디바이스 음성 인식", systemImage: "text.bubble")
+                Spacer()
+                Text(speechStatusLabel)
+                    .font(.caption)
+                    .foregroundStyle(speechAvailability.isReady ? Color.green : Color.secondary)
+            }
+
+            Text(SpeechTranscriptionSupport().statusText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if speechAvailability == .needsPermission {
+                Button {
+                    Task {
+                        _ = await SpeechTranscriptionSupport.requestPermission()
+                        refreshSpeechAvailability()
+                    }
+                } label: {
+                    Label("음성 인식 권한 허용", systemImage: "mic.badge.plus")
+                }
+            }
+
+            if speechAvailability == .denied || speechAvailability == .restricted {
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        openURL(url)
+                    }
+                } label: {
+                    Label("설정에서 음성 인식 켜기", systemImage: "gearshape")
+                }
+            }
+        } header: {
+            Text("전사 · 핵심 쟁점 요약")
+        } footer: {
+            Text("녹음 상세 화면에서 '전사 · 쟁점 요약'을 누르면 기기 안에서만 음성을 텍스트로 변환하고 격양 구간과 매핑해 핵심 발언·키워드를 정리합니다. 온디바이스 인식이 불가능한 기기에서는 서버 인식으로 넘어가지 않고 기능을 끕니다.")
+        }
+    }
+
+    private var speechStatusLabel: String {
+        switch speechAvailability {
+        case .ready: return "사용 가능"
+        case .needsPermission: return "권한 필요"
+        case .denied: return "꺼짐"
+        case .restricted: return "제한됨"
+        case .unsupported: return "미지원"
+        }
+    }
+
+    private func refreshSpeechAvailability() {
+        speechAvailability = SpeechTranscriptionSupport().availability
     }
 
     // MARK: - 파일 보호

@@ -17,6 +17,7 @@ Linux 환경에서 `xcodebuild`를 쓸 수 없으므로, Swift 구현(`VoiceGuar
 
 모든 상수는 `Packages/VoiceGuardCore/Sources/VoiceGuardCore/*.swift`와 동일하게 유지한다.
 """
+import re
 from dataclasses import dataclass
 
 
@@ -483,6 +484,216 @@ def scenario_steady_loud_environment():
     )
 
 
+
+# ---------------------------------------------------------------------------
+# 미러: EpisodeSummarizer (온디바이스 전사 -> 격양 타임라인 매핑 -> 쟁점 요약)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EpisodeEvent:
+    started_at_offset: float
+    ended_at_offset: float
+    peak_score: float
+
+
+MIN_AGITATION_OVERLAP_S = 0.2
+AGITATED_KEYWORD_WEIGHT = 2.0
+MAXIMUM_KEYWORDS = 5
+MAXIMUM_MARKERS = 20
+MINIMUM_KEYWORD_LENGTH = 2
+
+STOPWORDS = {
+    "그", "저", "것", "수", "때", "좀", "더", "안", "못", "뭐", "왜", "응", "네", "예", "아", "어", "음",
+    "이거", "그거", "저거", "그냥", "진짜", "정말", "너무", "많이", "다시", "이제", "아직", "또", "및", "등",
+    "거", "건", "게", "듯", "분", "쪽", "중", "위해", "대해", "대한", "관해",
+    "하고", "하는", "한다", "했다", "해서", "하면", "하지", "합니다", "입니다",
+    "있어", "없어", "있다", "없다", "같아", "같은", "그리고", "그런데", "근데", "하지만", "그래서", "그러면", "그럼",
+    "너", "나", "우리", "당신", "제가", "내가", "니가", "네가", "저는", "나는",
+    "the", "a", "an", "and", "or", "but", "so", "to", "of", "in", "on", "at", "is", "are", "was", "were",
+    "i", "you", "we", "it", "this", "that", "yeah", "ok", "okay", "um", "uh",
+}
+
+KOREAN_SUFFIXES = [
+    "에서는", "에서도", "에게는", "으로는", "으로서", "이라는", "이라서", "이라고", "라는", "라고",
+    "합니다", "입니다", "했는데", "하다가", "했어요", "하는데", "했어", "한다", "했다", "해서", "하면",
+    "하고", "하지", "인데", "이며", "이고", "이나", "라도", "든지", "까지", "부터", "보다", "처럼",
+    "마다", "조차", "밖에", "한테", "에게", "에서", "으로", "로서", "이랑", "와는", "과는",
+    "은", "는", "이", "가", "을", "를", "에", "의", "도", "와", "과", "로", "만", "께", "랑", "야", "아", "요", "죠", "네",
+]
+
+
+def tokenize(text):
+    return re.findall(r"[0-9a-z가-힣]+", text.lower())
+
+
+def stem(token):
+    for suffix in KOREAN_SUFFIXES:
+        if len(token) > len(suffix) and token.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def overlap_seconds(segment, event):
+    lower = max(segment["start"], event.started_at_offset)
+    upper = min(segment["end"], event.ended_at_offset)
+    return max(0.0, upper - lower)
+
+
+def annotate(segments, events):
+    result = []
+    for segment in sorted(segments, key=lambda s: (s["start"], s["end"], s["text"])):
+        overlap_total = 0.0
+        peak = 0.0
+        indexes = []
+        for index, event in enumerate(events):
+            overlap = overlap_seconds(segment, event)
+            if overlap <= 0:
+                continue
+            overlap_total += overlap
+            indexes.append(index)
+            peak = max(peak, event.peak_score)
+        is_agitated = overlap_total >= MIN_AGITATION_OVERLAP_S and bool(indexes)
+        result.append(
+            {
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+                "overlap": overlap_total,
+                "peak": peak if is_agitated else 0.0,
+                "indexes": indexes,
+                "is_agitated": is_agitated,
+            }
+        )
+    return result
+
+
+def select_key_claim(transcript, events):
+    agitated = [s for s in transcript if s["is_agitated"]]
+    if agitated:
+        best = agitated[0]
+        for candidate in agitated[1:]:
+            if (candidate["peak"], candidate["overlap"], -candidate["start"]) > (
+                best["peak"],
+                best["overlap"],
+                -best["start"],
+            ):
+                best = candidate
+        event_index = max(best["indexes"], key=lambda i: (events[i].peak_score, -i))
+        return {
+            "text": best["text"],
+            "start": best["start"],
+            "end": best["end"],
+            "peak": best["peak"],
+            "overlap": best["overlap"],
+            "event_index": event_index,
+            "fallback": False,
+        }
+    if not transcript or not events:
+        return None
+    peak_index = max(range(len(events)), key=lambda i: (events[i].peak_score, -i))
+    peak_event = events[peak_index]
+
+    def gap(segment):
+        if segment["end"] < peak_event.started_at_offset:
+            return peak_event.started_at_offset - segment["end"]
+        if segment["start"] > peak_event.ended_at_offset:
+            return segment["start"] - peak_event.ended_at_offset
+        return 0.0
+
+    nearest = min(transcript, key=lambda s: (gap(s), s["start"]))
+    return {
+        "text": nearest["text"],
+        "start": nearest["start"],
+        "end": nearest["end"],
+        "peak": peak_event.peak_score,
+        "overlap": nearest["overlap"],
+        "event_index": peak_index,
+        "fallback": True,
+    }
+
+
+def extract_keywords(transcript):
+    counts = {}
+    weights = {}
+    for segment in transcript:
+        increment = AGITATED_KEYWORD_WEIGHT if segment["is_agitated"] else 1.0
+        for token in tokenize(segment["text"]):
+            base = stem(token)
+            term = base if len(base) >= MINIMUM_KEYWORD_LENGTH else token
+            if len(term) < MINIMUM_KEYWORD_LENGTH:
+                continue
+            if term in STOPWORDS or base in STOPWORDS:
+                continue
+            if not any(ch.isalpha() for ch in term):
+                continue
+            counts[term] = counts.get(term, 0) + 1
+            weights[term] = weights.get(term, 0.0) + increment
+    ranked = sorted(counts, key=lambda term: (-weights[term], -counts[term], term))
+    return [(term, counts[term], weights[term]) for term in ranked[:MAXIMUM_KEYWORDS]]
+
+
+def make_markers(transcript, events, key_claim):
+    markers = []
+    if key_claim:
+        markers.append(("keyClaim", key_claim["start"], key_claim["peak"]))
+    for index, event in enumerate(events):
+        overlapping = [s for s in transcript if index in s["indexes"]]
+        if overlapping:
+            peak_segment = max(overlapping, key=lambda s: (s["peak"], s["overlap"], -s["start"]))
+            offset = peak_segment["start"]
+        else:
+            offset = event.started_at_offset + (event.ended_at_offset - event.started_at_offset) * 0.5
+        markers.append(("agitationPeak", offset, event.peak_score))
+    markers.sort(key=lambda m: (m[1], -m[2], 0 if m[0] == "keyClaim" else 1))
+    return markers[:MAXIMUM_MARKERS]
+
+
+def scenario_episode_summary():
+    """전사 타임라인 8구간 + 격양 3구간: 매핑·핵심 쟁점·키워드·마커가 Swift 테스트와 같은 값인지."""
+    events = [
+        EpisodeEvent(5.0, 8.1, 0.93),
+        EpisodeEvent(22.5, 25.8, 0.88),
+        EpisodeEvent(41.0, 44.0, 0.71),
+    ]
+    segments = [
+        {"text": "오늘 저녁에 뭐 먹을지 이야기해 보자", "start": 0.0, "end": 3.4},
+        {"text": "너는 또 약속 시간을 어겼잖아", "start": 4.2, "end": 7.0},
+        {"text": "지난번에도 약속을 지키지 않았어", "start": 7.6, "end": 10.2},
+        {"text": "그건 내가 회사 일이 있어서 그런 거야", "start": 12.0, "end": 16.0},
+        {"text": "약속이라는 건 서로 지켜야 하는 거야", "start": 21.0, "end": 23.4},
+        {"text": "알았어 다음엔 시간 지킬게", "start": 24.0, "end": 26.5},
+        {"text": "그렇게 말하면 나는 항상 시간에 늦는 사람이 돼", "start": 40.0, "end": 43.2},
+        {"text": "오늘은 그만 싸우고 밥 먹자", "start": 50.0, "end": 54.0},
+    ]
+    transcript = annotate(segments, events)
+    assert len(transcript) == 8
+    assert transcript[1]["is_agitated"] and transcript[1]["indexes"] == [0]
+    assert abs(transcript[1]["overlap"] - 2.0) < 1e-9
+    assert transcript[0]["is_agitated"] is False and transcript[0]["indexes"] == []
+
+    claim = select_key_claim(transcript, events)
+    assert claim["text"] == "너는 또 약속 시간을 어겼잖아", claim
+    assert abs(claim["start"] - 4.2) < 1e-9 and claim["event_index"] == 0
+
+    keywords = extract_keywords(transcript)
+    assert [term for term, _, _ in keywords[:2]] == ["시간", "약속"], keywords
+    assert keywords[0][1] == 3 and abs(keywords[0][2] - 6.0) < 1e-9
+
+    speech_seconds = sum(s["end"] - s["start"] for s in transcript)
+    agitated_speech = sum(s["end"] - s["start"] for s in transcript if s["is_agitated"])
+    assert abs(speech_seconds - 24.9) < 1e-9, speech_seconds
+    assert abs(agitated_speech - 13.5) < 1e-9, agitated_speech
+
+    markers = make_markers(transcript, events, claim)
+    assert [m[0] for m in markers] == ["keyClaim", "agitationPeak", "agitationPeak", "agitationPeak"], markers
+    assert [round(m[1], 1) for m in markers] == [4.2, 4.2, 24.0, 40.0], markers
+    return (
+        f"에피소드 요약: 핵심 쟁점 '{claim['text']}' · 키워드 "
+        f"{', '.join(t for t, _, _ in keywords[:2])} · 발화 {speech_seconds:.1f}초 · "
+        f"격양 발화 {agitated_speech:.1f}초 · 마커 {len(markers)}개"
+    )
+
+
 def run_tests():
     results = []
 
@@ -496,6 +707,7 @@ def run_tests():
     results.append(scenario_session_metadata())
     results.append(scenario_noise_floor_tracking())
     results.append(scenario_steady_loud_environment())
+    results.append(scenario_episode_summary())
 
     print("=" * 78)
     print(f"VoiceGuard DSP 시나리오 검증 — {len(results)}개 시나리오 통과")

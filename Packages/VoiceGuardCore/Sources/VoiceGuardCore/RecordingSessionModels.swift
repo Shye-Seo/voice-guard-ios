@@ -27,6 +27,8 @@ public struct RecordingSessionRecord: Identifiable, Codable, Equatable, Sendable
     public var levelEnvelope: [Double]
     /// 엔벨로프 1칸의 시간(초)
     public var envelopeBucketSeconds: Double
+    /// 온디바이스 전사·핵심 쟁점 요약(사용자가 리포트를 만들었을 때만 존재, v1.2에서 추가)
+    public var episodeReport: EpisodeReport?
 
     public init(
         id: UUID = UUID(),
@@ -44,7 +46,8 @@ public struct RecordingSessionRecord: Identifiable, Codable, Equatable, Sendable
         agitatedSeconds: TimeInterval = 0.0,
         agitationEvents: [AgitationEvent] = [],
         levelEnvelope: [Double] = [],
-        envelopeBucketSeconds: Double = 0.5
+        envelopeBucketSeconds: Double = 0.5,
+        episodeReport: EpisodeReport? = nil
     ) {
         self.id = id
         self.fileName = fileName
@@ -62,6 +65,7 @@ public struct RecordingSessionRecord: Identifiable, Codable, Equatable, Sendable
         self.agitationEvents = agitationEvents
         self.levelEnvelope = levelEnvelope
         self.envelopeBucketSeconds = max(0.1, envelopeBucketSeconds)
+        self.episodeReport = episodeReport
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -81,6 +85,7 @@ public struct RecordingSessionRecord: Identifiable, Codable, Equatable, Sendable
         case agitationEvents
         case levelEnvelope
         case envelopeBucketSeconds
+        case episodeReport
     }
 
     /// 이전 버전에서 저장된 index.json(신규 필드 없음)도 그대로 읽을 수 있게 디코딩한다.
@@ -102,6 +107,7 @@ public struct RecordingSessionRecord: Identifiable, Codable, Equatable, Sendable
         agitationEvents = try container.decodeIfPresent([AgitationEvent].self, forKey: .agitationEvents) ?? []
         levelEnvelope = try container.decodeIfPresent([Double].self, forKey: .levelEnvelope) ?? []
         envelopeBucketSeconds = max(0.1, try container.decodeIfPresent(Double.self, forKey: .envelopeBucketSeconds) ?? 0.5)
+        episodeReport = try container.decodeIfPresent(EpisodeReport.self, forKey: .episodeReport)
     }
 
     /// 레코드에 저장된 메타데이터로 분석 리포트를 구성한다.
@@ -121,6 +127,11 @@ public struct RecordingSessionRecord: Identifiable, Codable, Equatable, Sendable
     /// 분석 메타데이터가 없는(구버전) 녹음인지
     public var hasAnalysisMetadata: Bool {
         !agitationEvents.isEmpty || peakRMSDB > -89.0 || maxPitchHz > 0
+    }
+
+    /// 전사·쟁점 요약이 저장된 녹음인지
+    public var hasEpisodeReport: Bool {
+        episodeReport != nil
     }
 }
 
@@ -177,6 +188,17 @@ public enum SessionReportFormatter {
             }
             if record.agitationEvents.count > maximumEventLines {
                 lines.append("· 외 \(record.agitationEvents.count - maximumEventLines)건")
+            }
+        }
+
+        if let episode = record.episodeReport {
+            lines.append("")
+            lines.append("[전사·쟁점 요약]")
+            lines.append(episode.summary.headline)
+            if let keyClaim = episode.summary.keyClaim {
+                lines.append(
+                    "· \(timestampText(keyClaim.startedAtOffset)) 「\(keyClaim.text)」"
+                )
             }
         }
 

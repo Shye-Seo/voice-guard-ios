@@ -12,6 +12,7 @@ struct RecordingDetailView: View {
     @State private var draftNote: String = ""
     @State private var isEditingNote = false
     @State private var showingDeleteConfirmation = false
+    @State private var showingEpisodeReport = false
     @State private var copiedReport = false
 
     private var record: RecordingSessionRecord? {
@@ -50,6 +51,7 @@ struct RecordingDetailView: View {
                     legacyNotice
                 }
 
+                episodeReportCard(record)
                 noteCard(record)
                 shareCard(record)
                 fileCard(record)
@@ -59,6 +61,10 @@ struct RecordingDetailView: View {
         }
         .sheet(isPresented: $isEditingNote) {
             noteEditor(record)
+        }
+        .sheet(isPresented: $showingEpisodeReport) {
+            EpisodeReportView(recordID: record.id)
+                .environmentObject(recordingStore)
         }
         .confirmationDialog(
             "이 녹음을 삭제할까요?",
@@ -221,6 +227,70 @@ struct RecordingDetailView: View {
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
     }
 
+    /// 전사·핵심 쟁점 요약 카드(요약이 있으면 미리보기, 없으면 생성 진입점).
+    private func episodeReportCard(_ record: RecordingSessionRecord) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("전사 · 핵심 쟁점 요약", systemImage: "text.bubble")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                if record.hasEpisodeReport {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+            }
+
+            if let episode = record.episodeReport {
+                Text(episode.summary.headline)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !episode.summary.keywords.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(episode.summary.keywords.prefix(3)) { keyword in
+                            Text(keyword.term)
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.accentColor.opacity(0.12), in: Capsule())
+                        }
+                    }
+                }
+
+                Button {
+                    showingEpisodeReport = true
+                } label: {
+                    Label("리포트 열기", systemImage: "chevron.right")
+                        .font(.caption.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                }
+            } else {
+                Text("온디바이스 음성 인식으로 대화를 전사하고, 격양이 가장 심했던 발언과 반복 키워드를 정리합니다. 오디오는 기기 밖으로 나가지 않습니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button {
+                    showingEpisodeReport = true
+                } label: {
+                    Label("전사 · 쟁점 요약 만들기", systemImage: "waveform.badge.mic")
+                        .font(.caption.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
     private func noteCard(_ record: RecordingSessionRecord) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -267,6 +337,16 @@ struct RecordingDetailView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
                     .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+            }
+
+            if let episode = record.episodeReport {
+                ShareLink(item: EpisodeReportFormatter.reportText(for: episode)) {
+                    Label("전사·쟁점 요약 공유", systemImage: "text.bubble")
+                        .font(.subheadline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                }
             }
 
             Button {
